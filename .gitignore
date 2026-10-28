@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+archives/
+connector/runtime/
+connector/gpu-runtime/
+connector/bridge/session.jsonl
+connector/bridge/game-history.json
+connector/bridge/opening-book.json
+connector/bridge/settings.json
+connector/bridge/settings.json.tmp
+engine/*.exe
+engine/*.nnue
+*.lnk
+desktop.ini
+*.log
+*.tmp
+work/
+dist/
+build/
+# Local historical notes and private measurements
+/*.txt
+!/requirements.txt
+/启动练习连接.bat
+/开始下棋.bat
