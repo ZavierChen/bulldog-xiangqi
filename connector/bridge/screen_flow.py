@@ -45,6 +45,7 @@ class ScreenFlow:
         return self.mode
 
     def ad_closed(self):self._advance('upgrade',.35)
+    def points_closed(self):self._advance('upgrade',.35)
     def upgrade_closed(self):self._advance('continue',.6)
     def continued(self):self._advance('enter',3)
     def _advance(self,mode,delay):

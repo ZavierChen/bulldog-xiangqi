@@ -120,7 +120,7 @@ class App:
                 ponder=Ponder(ENGINE,threads,ponder_branches,min_seconds=seconds,notify=lambda data:self.events.put(('ponder',data)),economical=ponder_economical)
             else:self.events.put(('ponder',{'state':'disabled'}))
             submitted=0;last_error=None;pending_since=None
-            recovery=Recovery();popups=Popups();ads=Ads();last_popup=0;last_ad=0;probe_used=False;sync_failures=0
+            recovery=Recovery();popups=Popups();ads=Ads();last_popup=0;last_points=0;last_ad=0;probe_used=False;sync_failures=0
             rounds=Rounds(limit)
             flow=ScreenFlow(fallback_seconds)
             budget=ThinkingBudget(seconds,dynamic_time)
@@ -142,6 +142,24 @@ class App:
                     first,rect=window.capture();self.stop.wait(.12);second,rect2=window.capture()
                     if rect!=rect2:raise ValueError('窗口正在移动，重新定位')
                     if task:event('screen_flow_scan',stage=task,expected=flow.mode)
+                    # This offer can appear before/after an ad or upgrade. Check
+                    # its title + own red X before the generic ad-card heuristic.
+                    if task:trace.stage('points_popup_scan')
+                    points1=popups.points(first) if task else None
+                    points2=popups.points(second) if task else None
+                    if (points1 or points2) and not (points1 and points2 and max(abs(a-b) for a,b in zip(points1,points2))<3):
+                        self.events.put(('status','积分加速弹窗正在变化，等待关闭按钮稳定。'));self.stop.wait(.15);continue
+                    if points1 and points2 and max(abs(a-b) for a,b in zip(points1,points2))<3:
+                        recovery.lost(time.time())
+                        if time.monotonic()-last_points>1:
+                            fresh,rect3=window.capture();point=popups.points(fresh)
+                            if rect3!=rect or not point or max(abs(a-b) for a,b in zip(point,points2))>=3:raise ValueError('积分加速弹窗正在变化')
+                            if self.stop.is_set():break
+                            window.click(point,rect);window.park(rect);last_points=time.monotonic();event('points_dismissed')
+                            flow.points_closed()
+                            self.events.put(('status','已关闭积分加速提示，正在恢复继续对局…'));self.stop.wait(.35)
+                        else:self.stop.wait(.15)
+                        continue
                     if task in ('ad','fallback'):trace.stage('ad_scan')
                     ad1=ads.button(first) if task in ('ad','fallback') else None
                     ad2=ads.button(second) if task in ('ad','fallback') else None
