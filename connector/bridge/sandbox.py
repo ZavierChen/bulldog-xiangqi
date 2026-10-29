@@ -14,7 +14,9 @@ class Sandbox(ttk.Frame):
         self.busy=False;self.closed=False;self.generation=0;self.cancelled=threading.Event();self.hints=[];self.selected=0;self.origin=None
         self.tool=tk.StringVar(value='move');self.side=tk.StringVar(value='红方');self.seconds=tk.IntVar(value=3)
         self.status=tk.StringVar(value='选择棋子后点击棋盘摆放；也可以直接拖动棋子。右键删除。')
+        self.recovery_callback=None
         self.summary=tk.StringVar(value='摆好局面后点击“电脑提示”，按评分给出下一步的三种选择。')
+        self.recovery_cancel=None
         self.analysis_red=tk.StringVar(value='红方：评分暂无｜胜率暂无');self.analysis_black=tk.StringVar(value='黑方：评分暂无｜胜率暂无')
         toolbar=ttk.Frame(self);toolbar.pack(fill='x',pady=(0,10))
         ttk.Label(toolbar,text='沙盒摆棋',style='Section.TLabel').pack(side='left')
@@ -47,6 +49,9 @@ class Sandbox(ttk.Frame):
         self.analyze_button=ttk.Button(actions,text='电脑提示 · 3 种建议',command=self.analyze,style='Accent.TButton');self.analyze_button.pack(side='left',fill='x',expand=True)
         ttk.Button(actions,text='停止',command=self.cancel,style='Small.TButton').pack(side='left',padx=(6,0))
         ttk.Label(right,textvariable=self.summary,wraplength=350,style='Muted.TLabel').pack(fill='x')
+        self.recovery_bar=ttk.Frame(right)
+        ttk.Button(self.recovery_bar,text='确认棋盘并续接',command=self.confirm_recovery,style='Accent.TButton').pack(side='left',fill='x',expand=True)
+        ttk.Button(self.recovery_bar,text='取消校正',command=self.cancel_recovery,style='Small.TButton').pack(side='left',padx=5)
         self.cards=[]
         for rank in range(3):
             button=tk.Button(right,text=f'{rank+1}  等待分析',anchor='w',justify='left',wraplength=320,padx=12,pady=11,relief='flat',bg='white',fg=COLORS[rank],font=('Microsoft YaHei',10),command=lambda i=rank:self.select_hint(i))
@@ -61,6 +66,20 @@ class Sandbox(ttk.Frame):
     def refresh(self):
         self.board.set_position(self.model.board,self.board.flipped)
         self.side.set('红方' if self.model.side=='w' else '黑方')
+    def begin_recovery(self,callback,cancel):
+        self.recovery_callback=callback;self.recovery_cancel=cancel
+        self.recovery_bar.pack(fill='x',pady=6,before=self.cards[0])
+        self.summary.set('手动恢复：修正棋子并选择当前走棋方，确认后恢复连接。')
+        self.status.set('连接已暂停，保留局面与计算。可以拖动、增删棋子或导入 FEN。')
+    def confirm_recovery(self):
+        try:validate(self.model.board,self.model.side)
+        except ValueError as error:self.status.set(str(error));return
+        if self.recovery_callback:self.recovery_callback([row.copy() for row in self.model.board],self.model.side)
+    def end_recovery(self):
+        self.recovery_callback=None;self.recovery_cancel=None;self.recovery_bar.pack_forget()
+    def cancel_recovery(self):
+        callback=self.recovery_cancel;self.end_recovery()
+        if callback:callback()
     def invalidate(self):
         self.generation+=1;self.cancel();self.hints=[];self.board.arrows=[];self.origin=None;self.board.selection=None
         self.analysis_red.set('红方：评分暂无｜胜率暂无');self.analysis_black.set('黑方：评分暂无｜胜率暂无')

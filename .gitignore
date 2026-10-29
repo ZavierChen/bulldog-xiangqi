@@ -5,6 +5,8 @@ __pycache__/
 archives/
 connector/runtime/
 connector/gpu-runtime/
+connector/models/
+connector/bridge/local_data/
 connector/bridge/session.jsonl
 connector/bridge/game-history.json
 connector/bridge/opening-book.json

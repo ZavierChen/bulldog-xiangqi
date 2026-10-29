@@ -12,21 +12,29 @@ u.SetForegroundWindow.argtypes=[wintypes.HWND]
 u.GetWindowThreadProcessId.argtypes=[wintypes.HWND,ctypes.POINTER(wintypes.DWORD)]
 
 class Window:
-    def __init__(self):
+    def __init__(self,target=None):
         self.hwnd=None
+        self.target=target
         self.lost_foreground=None;self.lost_at=0
         try:self.bind()
         except ValueError:pass
     def bind(self):
+        if self.target:
+            hwnd=self.target.get('hwnd');pid=wintypes.DWORD()
+            if hwnd and u.IsWindow(hwnd):
+                u.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
+                if pid.value==self.target.get('pid'):
+                    self.hwnd=hwnd;return
         found=[]
         callback=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
         @callback
         def visit(hwnd,_):
             title=ctypes.create_unicode_buffer(512);u.GetWindowTextW(hwnd,title,512)
-            if title.value in ('天天象棋','象棋') and u.IsWindowVisible(hwnd):found.append(hwnd)
+            wanted=(title.value==self.target.get('title')) if self.target else title.value in ('天天象棋','象棋')
+            if wanted and u.IsWindowVisible(hwnd):found.append(hwnd)
             return True
         u.EnumWindows(visit,0)
-        if len(found)!=1:raise ValueError('请只打开一个支持的象棋窗口（天天象棋或象棋）')
+        if len(found)!=1:raise ValueError('所选棋局窗口已关闭或不唯一，请重新选择棋盘' if self.target else '请只打开一个支持的象棋窗口（天天象棋或象棋）')
         self.hwnd=found[0]
     def rect(self):
         if not u.IsWindow(self.hwnd):self.bind()
@@ -58,3 +66,23 @@ class Window:
         x,y=point;u.SetCursorPos(round(rect[0]+x),round(rect[1]+y))
         u.mouse_event(2,0,0,0,0);u.mouse_event(4,0,0,0,0)
     def park(self,rect):u.SetCursorPos(rect[2]-30,rect[1]+65)
+    def descriptor(self):
+        pid=wintypes.DWORD();u.GetWindowThreadProcessId(self.hwnd,ctypes.byref(pid))
+        title=ctypes.create_unicode_buffer(512);u.GetWindowTextW(self.hwnd,title,512)
+        return {'hwnd':int(self.hwnd),'pid':pid.value,'title':title.value}
+
+
+def target_windows():
+    targets=[];callback=ctypes.WINFUNCTYPE(wintypes.BOOL,wintypes.HWND,wintypes.LPARAM)
+    @callback
+    def visit(hwnd,_):
+        if not u.IsWindowVisible(hwnd) or u.IsIconic(hwnd):return True
+        title=ctypes.create_unicode_buffer(512);u.GetWindowTextW(hwnd,title,512)
+        if not title.value or title.value in ('Program Manager','Windows Input Experience'):return True
+        pid=wintypes.DWORD();u.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
+        if pid.value==os.getpid():return True
+        rect=wintypes.RECT();u.GetWindowRect(hwnd,ctypes.byref(rect))
+        if rect.right-rect.left<250 or rect.bottom-rect.top<250:return True
+        targets.append({'hwnd':int(hwnd),'pid':pid.value,'title':title.value})
+        return True
+    u.EnumWindows(visit,0);return targets

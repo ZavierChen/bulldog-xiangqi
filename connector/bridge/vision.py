@@ -260,6 +260,7 @@ def move_pixels(move,box,flipped):
     for i in (0,2):
         col=ord(move[i])-ord('a'); row=9-int(move[i+1])
         if flipped: col,row=8-col,9-row
-        if getattr(box,'profile','original')=='alt':pts.append((x+(37+col*78.9)*w/706,y+(40+row*77.8)*h/799))
+        if getattr(box,'profile','original')=='manual':pts.append((x+col*w/8,y+row*h/9))
+        elif getattr(box,'profile','original')=='alt':pts.append((x+(37+col*78.9)*w/706,y+(40+row*77.8)*h/799))
         else:pts.append((x+(31+col*48)*w/447, y+(28+row*48)*h/495))
     return pts

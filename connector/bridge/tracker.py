@@ -1,5 +1,5 @@
 """Keep the side to move and move history in sync with observed legal positions."""
-import os,re,subprocess,json,tempfile,threading,time
+import os,re,subprocess,json,tempfile,threading,time,copy
 from vision import fen
 
 class RepetitionBlocked(RuntimeError):pass
@@ -167,6 +167,7 @@ class Tracker:
         self.pv_hint=None;self.ponder_hint=None;self.last_ponder=None;self.current_plan=None;self.last_source='engine'
         self.seen_positions={position_key(board,side)};self.filtered_reasons={}
         self.last_evaluation=None;self.refine=False
+        self.expected_lines=[]
         try:
             with open(os.path.join(os.path.dirname(__file__),'opening-book.json'),encoding='utf-8') as f:self.book=json.load(f)['positions']
         except (OSError,ValueError,KeyError):self.book={}
@@ -215,6 +216,7 @@ class Tracker:
         if self.has_plan():
             candidate=self.current_plan['move']
             if candidate in allowed and (not self.refine or self.current_plan.get('refined',False)):
+                self.last_evaluation=copy.deepcopy(self.current_plan.get('evaluation'))
                 self.last_source='position_cache';return candidate
             self.current_plan=None
         hint=self.ponder_hint;self.ponder_hint=None;self.last_ponder=None
@@ -249,10 +251,12 @@ class Tracker:
     def has_plan(self):
         return bool(self.current_plan and self.current_plan['prefix']==self.moves and self.current_plan['key']==fen(self.board,self.side))
     def remember_plan(self,move):
-        self.current_plan={'key':fen(self.board,self.side),'prefix':self.moves.copy(),'move':move,'refined':self.refine}
+        self.current_plan={'key':fen(self.board,self.side),'prefix':self.moves.copy(),'move':move,'refined':self.refine,
+                           'evaluation':copy.deepcopy(self.last_evaluation)}
         return move
     def cache_line(self,pv):
         if len(pv)<3:return
+        self.expected_lines=[{'initial':self.initial,'prefix':self.moves.copy(),'pv':pv[:12].copy(),'reuse':True}]
         predicted=moved(moved(self.board,pv[0]),pv[1])
         self.pv_hint={'prefix':self.moves+pv[:2],'key':fen(predicted,self.side).split(' - ')[0],'move':pv[2],'continuation':pv[2:]}
     def reconcile(self,observed):
@@ -260,3 +264,30 @@ class Tracker:
         matches=[move for move in self.legal() if moved(self.board,move)==observed]
         if len(matches)!=1:raise ValueError(f'新局面无法唯一对应一步合法棋（{len(matches)} 个候选）')
         self.accept_move(matches[0]);return matches[0]
+    def reconcile_known(self,observed,extra_lines=(),side=None):
+        """Recover a uniquely matching searched path without resetting history."""
+        if observed==self.board:return side is None or side==self.side
+        candidates={}
+        for entry in self.expected_lines+list(extra_lines):
+            if entry.get('initial',self.initial)!=self.initial:continue
+            full=entry['prefix']+entry['pv']
+            if full[:len(self.moves)]!=self.moves:continue
+            remaining=full[len(self.moves):];board=self.board
+            try:
+                for count,move in enumerate(remaining[:8],1):
+                    board=moved(board,move)
+                    next_side=self.side if count%2==0 else ('b' if self.side=='w' else 'w')
+                    if board==observed and (side is None or side==next_side):
+                        path=tuple(remaining[:count])
+                        previous=candidates.get(path)
+                        if previous is None or entry.get('reuse'):candidates[path]=(remaining[count:],entry.get('reuse',False))
+            except (ValueError,IndexError):continue
+        if len(candidates)!=1:return False
+        path,(continuation,reuse)=next(iter(candidates.items()))
+        for index,move in enumerate(path):
+            if move not in self.engine.legal(self.initial,self.moves+list(path[:index])):return False
+        for move in path:self.accept_move(move)
+        if reuse and continuation:
+            self.pv_hint={'prefix':self.moves.copy(),'key':position_key(self.board,self.side),
+                          'move':continuation[0],'continuation':continuation}
+        return True

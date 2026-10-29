@@ -26,6 +26,9 @@ class App:
         self.root=root
         self.events=queue.Queue();self.stop=threading.Event();self.running=False
         self.commands=queue.Queue()
+        self.editor_pause=threading.Event();self.recovery_commands=queue.Queue()
+        self.action_lock=threading.Lock();self.editor_snapshot_pending=threading.Event();self.editor_generation=0
+        self.retained_bridge=None;self.retained_recognizer=None;self.retained_target=None;self.retained_calibration=None
         self.status=tk.StringVar(value='打开天天象棋棋盘后点击开始；Esc 可停止。')
         self.seconds=tk.IntVar(value=2);self.threads=tk.IntVar(value=recommended_threads())
         self.thinking_started=None;self.thinking_text=tk.StringVar(value='本次思考：尚未开始')
@@ -40,15 +43,19 @@ class App:
         self.ponder_text=tk.StringVar(value='后台预判：等待对方回合')
         self.budget_text=tk.StringVar(value='思考预算：等待局面')
         self.fallback_first=tk.StringVar(value='我方先手')
+        self.manual_enabled=tk.BooleanVar(value=False);self.manual_calibration=None;self.grid_picker=None
+        self.manual_text=tk.StringVar(value='自动定位；其他软件可用两点选择棋盘。')
         self.connection_text=tk.StringVar(value='先识别棋盘；本方固定为画面下方，无头像时按所选先手接入')
         self.analysis_key=None;self.analysis_title=tk.StringVar(value='局面分析（复用现有搜索；概率为引擎估计）')
         self.red_analysis=tk.StringVar(value=format_analysis(None,None)[0]);self.black_analysis=tk.StringVar(value=format_analysis(None,None)[1])
         try:
             with open(os.path.join(HERE,'settings.json'),encoding='utf-8') as f:settings=json.load(f)
-            for name in ('seconds','threads','game_limit','unlimited','auto_reconnect','use_gpu','fallback_seconds','ponder_enabled','ponder_branches','ponder_economical','dynamic_time','fallback_first'):
+            for name in ('seconds','threads','game_limit','unlimited','auto_reconnect','use_gpu','fallback_seconds','ponder_enabled','ponder_branches','ponder_economical','dynamic_time','fallback_first','manual_enabled'):
                 if name in settings:getattr(self,name).set(settings[name])
+            self.manual_calibration=settings.get('manual_calibration')
+            if self.manual_calibration:self.manual_text.set('两点定位：'+self.manual_calibration.get('target',{}).get('title','已选择窗口'))
         except (OSError,ValueError,tk.TclError):pass
-        self.last_move=None;self.view_flipped=False
+        self.last_move=None;self.view_flipped=False;self.has_confirmed_board=False
         self.position_label=tk.StringVar(value='等待识别局面')
         self.connected_board=[['_']*9 for _ in range(10)];self.connected_side='w'
         from workspace_ui import build_shell
@@ -62,9 +69,36 @@ class App:
         if not any(piece!='_' for row in self.connected_board for piece in row):
             self.status.set('请先连接并识别一个棋盘。');return
         self.sandbox.load(self.connected_board,self.connected_side or 'w');self.notebook.select(self.sandbox)
+    def edit_connection(self):
+        with self.action_lock:self.editor_pause.set()
+        self.sandbox.cancel();self.editor_generation+=1
+        if self.running:
+            self.editor_snapshot_pending.set();self.status.set('正在暂停落子并核对最后一步，再打开校正棋盘…');return
+        self.open_connection_editor()
+    def open_connection_editor(self):
+        board=self.connected_board;side=self.connected_side or 'w'
+        if not any(p!='_' for row in board for p in row):
+            try:
+                from sandbox_model import parse_fen
+                with open(os.path.join(HERE,'game-history.json'),encoding='utf-8') as f:board,side=parse_fen(json.load(f)['current'])
+            except (OSError,ValueError,KeyError):board=self.sandbox.model.board
+        self.sandbox.load(board,side);self.sandbox.board.flipped=self.view_flipped;self.sandbox.board.redraw()
+        self.sandbox.begin_recovery(self.confirm_connection,self.cancel_connection_edit)
+        self.notebook.select(self.sandbox);self.root.lift();self.root.focus_force()
+        self.status.set('已暂停连接；校正棋子和当前走棋方后，点击确认棋盘并续接。')
+    def cancel_connection_edit(self):
+        self.editor_generation+=1;self.editor_snapshot_pending.clear();self.editor_pause.clear();self.notebook.select(0);self.status.set('已取消校正，保留原局面与计算。')
+    def confirm_connection(self,board,side):
+        from sandbox_model import validate
+        try:validate(board,side)
+        except ValueError as error:self.sandbox.status.set(str(error));return
+        self.recovery_commands.put({'board':board,'side':side,'flipped':self.view_flipped})
+        self.notebook.select(0);self.status.set('正在核对截图、学习已确认棋子并恢复连接…')
+        if not self.running:self.start()
     def start(self):
         if self.running:return
         if self.sandbox.busy:self.status.set('沙盒正在分析，请先停止沙盒提示。');return
+        if self.manual_enabled.get() and not self.manual_calibration:self.status.set('请先点击“手动识别 · 选两点”确定棋盘范围。');return
         try:seconds=max(1,min(30,int(self.seconds.get())));threads=max(1,min(os.cpu_count() or 1,int(self.threads.get())))
         except (ValueError,tk.TclError):self.status.set('请输入有效秒数和线程数');return
         try:limit=0 if self.unlimited.get() else max(1,int(self.game_limit.get()))
@@ -73,11 +107,26 @@ class App:
         while not self.commands.empty():self.commands.get_nowait()
         try:
             with open(os.path.join(HERE,'settings.json'),'w',encoding='utf-8') as f:
-                json.dump({name:getattr(self,name).get() for name in ('seconds','threads','game_limit','unlimited','auto_reconnect','use_gpu','fallback_seconds','ponder_enabled','ponder_branches','ponder_economical','dynamic_time','fallback_first')},f)
+                settings={name:getattr(self,name).get() for name in ('seconds','threads','game_limit','unlimited','auto_reconnect','use_gpu','fallback_seconds','ponder_enabled','ponder_branches','ponder_economical','dynamic_time','fallback_first','manual_enabled')}
+                settings['manual_calibration']=self.manual_calibration;json.dump(settings,f)
         except OSError:pass
-        threading.Thread(target=self.run,args=(seconds,threads,limit,self.auto_reconnect.get(),self.use_gpu.get(),self.fallback_seconds.get(),self.ponder_enabled.get(),self.ponder_branches.get(),self.ponder_economical.get(),self.dynamic_time.get(),self.connection_config()),daemon=True).start()
+        calibration=json.loads(json.dumps(self.manual_calibration)) if self.manual_enabled.get() else None
+        threading.Thread(target=self.run,args=(seconds,threads,limit,self.auto_reconnect.get(),self.use_gpu.get(),self.fallback_seconds.get(),self.ponder_enabled.get(),self.ponder_branches.get(),self.ponder_economical.get(),self.dynamic_time.get(),self.connection_config(),calibration),daemon=True).start()
     def connection_config(self,manual=False):
-        return {'mode':'manual' if manual else 'auto','player':'bottom','initial_turn':'other' if self.fallback_first.get()=='对方先手' else 'ours'}
+        return {'mode':'grid' if self.manual_enabled.get() else ('manual' if manual else 'auto'),'player':'bottom','initial_turn':'other' if self.fallback_first.get()=='对方先手' else 'ours'}
+    def pick_grid(self):
+        if self.grid_picker is not None and self.grid_picker.winfo_exists():self.grid_picker.lift();return
+        if self.running:
+            self.stop.set();self.status.set('正在停止连接，然后选择棋盘…');self.root.after(150,self.pick_grid);return
+        from manual_picker import GridPicker
+        self.grid_picker=GridPicker(self.root,self.grid_selected,self.manual_calibration)
+    def grid_selected(self,calibration):
+        self.manual_calibration=calibration;self.manual_enabled.set(True);self.fallback_first.set('我方先手')
+        self.manual_text.set('两点定位：'+calibration['target']['title'])
+        self.status.set('两点已确定，默认我方先走。点击开始连接；开局可自动学习皮肤。')
+    def auto_grid(self):
+        if self.running:self.status.set('请先停止连接，再切换定位方式。');return
+        self.manual_enabled.set(False);self.manual_text.set('已恢复自动定位。')
     def fallback_changed(self):
         try:
             path=os.path.join(HERE,'settings.json')
@@ -104,7 +153,7 @@ class App:
         if evaluation:self.events.put(('evaluation',{'key':position_key(bridge.tracker.board,bridge.tracker.side),'side':bridge.tracker.side,'evaluation':evaluation}))
         self.events.put(('thinking_end',(elapsed,bridge.tracker.last_source)))
         return move,elapsed
-    def run(self,seconds,threads,limit,auto_reconnect,use_gpu=True,fallback_seconds=30,ponder_enabled=True,ponder_branches=3,ponder_economical=True,dynamic_time=True,connection=None):
+    def run(self,seconds,threads,limit,auto_reconnect,use_gpu=True,fallback_seconds=30,ponder_enabled=True,ponder_branches=3,ponder_economical=True,dynamic_time=True,connection=None,manual_calibration=None):
         engine=None;ponder=None;bridge=None
         connection=dict(connection or {'mode':'auto','player':'bottom','initial_turn':'w'})
         commands=getattr(self,'commands',queue.Queue());recalibrate=False
@@ -113,14 +162,29 @@ class App:
             record={'time':time.time(),'kind':kind,**data};log.write(json.dumps(record,ensure_ascii=False)+'\n')
         try:
             from windows_io import Window,u
-            window=Window();window.focus();time.sleep(.6)
-            recognizer=Recognizer(use_gpu=use_gpu);event('recognizer_started',backend=recognizer.backend)
-            engine=Engine(ENGINE,threads=threads,hash_mb=512);bridge=Bridge(recognizer,engine,history_path=os.path.join(HERE,'game-history.json'),**connection)
+            window=Window(manual_calibration['target']) if manual_calibration else Window();window.focus();time.sleep(.6)
+            engine=Engine(ENGINE,threads=threads,hash_mb=512)
+            target=window.descriptor()
+            same_target=self.retained_target==target
+            if same_target and self.retained_recognizer is not None and self.retained_calibration==manual_calibration:
+                recognizer=self.retained_recognizer
+            elif manual_calibration:
+                from manual_vision import ManualRecognizer,START
+                recognizer=ManualRecognizer(manual_calibration,engine.legal(START,[]),use_gpu=use_gpu)
+            else:recognizer=Recognizer(use_gpu=use_gpu)
+            event('recognizer_started',backend=recognizer.backend)
+            if same_target and self.retained_bridge is not None:
+                bridge=self.retained_bridge;bridge.recognizer=recognizer;bridge.engine=engine
+                if bridge.tracker:bridge.tracker.engine=engine
+            else:bridge=Bridge(recognizer,engine,history_path=os.path.join(HERE,'game-history.json'),**connection)
+            bridge.mode=connection['mode'];bridge.player=connection['player'];bridge.initial_turn=connection['initial_turn']
+            self.retained_target=target;self.retained_bridge=bridge;self.retained_recognizer=recognizer;self.retained_calibration=manual_calibration
             if ponder_enabled:
                 ponder=Ponder(ENGINE,threads,ponder_branches,min_seconds=seconds,notify=lambda data:self.events.put(('ponder',data)),economical=ponder_economical)
             else:self.events.put(('ponder',{'state':'disabled'}))
             submitted=0;last_error=None;pending_since=None
             recovery=Recovery();popups=Popups();ads=Ads();last_popup=0;last_points=0;last_ad=0;probe_used=False;sync_failures=0
+            if bridge.pending:pending_since=time.time()
             rounds=Rounds(limit)
             flow=ScreenFlow(fallback_seconds)
             budget=ThinkingBudget(seconds,dynamic_time)
@@ -129,17 +193,66 @@ class App:
                 if u.GetAsyncKeyState(0x1B)&0x8001:self.stop.set();break
                 trace=CycleTrace(self.events.put)
                 try:
+                    if self.editor_pause.is_set() and self.recovery_commands.empty():
+                        if ponder:ponder.pause()
+                        if self.editor_snapshot_pending.is_set():
+                            generation=self.editor_generation;self.editor_snapshot_pending.clear()
+                            try:
+                                window.focus();self.stop.wait(.3);a,r1=window.capture();self.stop.wait(.15);b,r2=window.capture()
+                                if r1==r2:
+                                    bridge.observe_pair(a,b)
+                                    self.events.put(('board_info',(bridge.tracker.board,bridge.tracker.moves[-1] if bridge.tracker.moves else None,bridge.tracker.side,bridge.flipped)))
+                            except (ValueError,OSError):pass
+                            self.events.put(('editor_ready',generation))
+                        trace.stage('wait_manual');self.stop.wait(.15);continue
+                    if not self.recovery_commands.empty():
+                        request=self.recovery_commands.get_nowait()
+                        try:
+                            from manual_vision import ManualRecognizer,START
+                            from visual_stability import stable_pieces
+                            window.focus();self.stop.wait(.2);a,r1=window.capture();self.stop.wait(.12);b,r2=window.capture()
+                            if r1!=r2:raise ValueError('窗口仍在移动，请稍后重新确认')
+                            if not manual_calibration:
+                                box=bridge.box or recognizer.locate(b)[0]
+                                p1,p2=move_pixels('a9i0',box,False);h,w=b.shape[:2]
+                                manual_calibration={'version':1,'target':window.descriptor(),'corners':[[p1[0]/w,p1[1]/h],[p2[0]/w,p2[1]/h]],'reference_size':[w,h],'bottom_color':'auto'}
+                                recognizer=ManualRecognizer(manual_calibration,engine.legal(START,[]),use_gpu)
+                            box=recognizer.locate(b)[0]
+                            # The external opponent is not paused by our editor.
+                            # Accept its completed move only when both frames
+                            # independently read the same, uniquely legal change.
+                            try:
+                                observed,of,_=recognizer.read(a);observed2,of2,_=recognizer.read(b)
+                            except ValueError:observed=observed2=None
+                            if observed is not None and observed==observed2 and of==of2==request['flipped'] and observed!=request['board']:
+                                from controller import advance_manual_confirmation
+                                board,side,advanced=advance_manual_confirmation(engine,request['board'],request['side'],observed)
+                                request=dict(request,board=board,side=side)
+                                if advanced:event('manual_recovery_opponent_advanced')
+                            if not stable_pieces(a,b,request['board'],box,request['flipped']):raise ValueError('棋子仍被特效遮挡，等待稳定后再确认')
+                            recognizer.learn_confirmed(b,request['board'],request['flipped'])
+                            retained=bridge.confirm_board(request['board'],request['side'],request['flipped'],box)
+                            bridge.recognizer=recognizer
+                            if ponder and not retained:ponder.clear()
+                            self.retained_recognizer=recognizer;self.retained_calibration=manual_calibration
+                            self.events.put(('recovery_applied',manual_calibration));self.events.put(('board_info',(request['board'],None,request['side'],request['flipped'])))
+                            event('manual_recovery_applied',analysis_retained=retained)
+                            self.editor_pause.clear();pending_since=None;probe_used=False;flow.board_ok();last_error=None
+                        except (ValueError,OSError) as error:
+                            self.events.put(('status','尚未续接：'+str(error)+'。可回到沙盒修改并再次确认。'))
+                        continue
                     while not commands.empty():
                         connection=commands.get_nowait();recalibrate=True
                         bridge.mode=connection['mode'];bridge.player='bottom';bridge.initial_turn=connection['initial_turn']
                         flow.board_ok()
                         if ponder:ponder.clear()
                     task=flow.next()
-                    if ponder and flow.mode not in ('board','enter'):ponder.clear()
+                    if ponder and flow.mode not in ('board','enter'):ponder.pause()
                     if flow.mode not in ('board','enter') and task is None:
                         trace.stage('wait_ui');self.stop.wait(.2);continue
                     trace.stage('capture')
                     first,rect=window.capture();self.stop.wait(.12);second,rect2=window.capture()
+                    if self.editor_pause.is_set():continue
                     if rect!=rect2:raise ValueError('窗口正在移动，重新定位')
                     if task:event('screen_flow_scan',stage=task,expected=flow.mode)
                     if task:trace.stage('ad_scan')
@@ -160,8 +273,7 @@ class App:
                         self.events.put(('status','广告仍在遮挡，等待关闭入口；暂不点击后方按钮。'))
                         flow.ad_wait()
                         self.stop.wait(.2);continue
-                    # This offer can appear before/after an ad or upgrade. Check
-                    # its title + own red X before the generic ad-card heuristic.
+                    # Optional offers are considered only after topmost ads.
                     if task:trace.stage('points_popup_scan')
                     points1=popups.points(first) if task else None
                     points2=popups.points(second) if task else None
@@ -205,6 +317,8 @@ class App:
                                 rounds.continue_sent=False;raise ValueError('续战按钮变化，等待稳定')
                             if self.stop.is_set():break
                             window.click(button3,rect);window.park(rect);event('continue_clicked',games=rounds.finished,features=recognizer.end_screens.last_features)
+                            if ponder:ponder.clear()
+                            if hasattr(recognizer,'reset_game'):recognizer.reset_game()
                             flow.continued()
                             bridge=Bridge(recognizer,engine,history_path=os.path.join(HERE,'game-history.json'),**connection);pending_since=None
                             self.events.put(('status',f'已完成 {rounds.finished} 局，正在进入下一局…'));self.stop.wait(.4)
@@ -212,26 +326,31 @@ class App:
                         continue
                     if task:flow.missed(task)
                     trace.stage('board_sync')
+                    if ponder:bridge.predicted_lines=ponder.expected_lines(bridge.tracker)
                     try:
                         if recalibrate:
-                            bridge.resync_pair(first,second);pending_since=None;probe_used=False;recalibrate=False
+                            bridge.resync_pair(first,second,preserve_analysis=False);pending_since=None;probe_used=False;recalibrate=False
                             event('first_player_changed',ours=bridge.ours,turn=bridge.tracker.side)
                         state=bridge.observe_pair(first,second);sync_failures=0
                     except ValueError as sync_error:
-                        if getattr(bridge,'observed_board',None) is not None:self.events.put(('board_info',(bridge.observed_board,None,None,bridge.flipped)))
+                        partial=getattr(recognizer,'partial_board',None)
+                        if partial is not None and bridge.tracker is None:self.events.put(('board_info',(partial,None,None,getattr(recognizer,'last_flipped',False))))
+                        elif getattr(bridge,'observed_board',None) is not None:self.events.put(('board_info',(bridge.observed_board,None,None,bridge.flipped)))
                         previous_mode=flow.mode;flow.board_failed()
                         if flow.mode!=previous_mode:event('screen_flow_started',reason='four_failed_board_reads')
                         if any(t in str(sync_error) for t in ('无法唯一对应','未能匹配本方走法','头像提示与局面')):
                             sync_failures+=1
                             if sync_failures>=3:
-                                old_moves=bridge.resync_pair(first,second);pending_since=None;probe_used=False;sync_failures=0
-                                event('position_resynced',previous_moves=old_moves)
+                                old_pending=bridge.pending
+                                old_moves=bridge.resync_pair(first,second);sync_failures=0
+                                if bridge.pending!=old_pending:pending_since=None;probe_used=False
+                                event('position_resynced',previous_moves=old_moves,analysis_retained=bridge.last_resync_reused)
                         raise
                     if state!='complete':flow.board_ok(fen(bridge.tracker.board,bridge.tracker.side) if state=='waiting' else None)
                     paused=recovery.restored(time.time())
                     if paused:
                         if pending_since:pending_since+=paused
-                        event('reconnected',paused_seconds=round(paused,2))
+                        event('reconnected',paused_seconds=round(paused,2),cached_plan=bridge.tracker.has_plan(),cached_branches=len(ponder.results['lines']) if ponder and ponder.results else 0)
                     if state in ('ready','waiting') and rounds.continue_sent:rounds.new_game()
                     self.events.put(('board_info',(bridge.tracker.board,bridge.tracker.moves[-1] if bridge.tracker.moves else None,bridge.tracker.side,bridge.flipped)))
                     self.events.put(('connection_info',(getattr(bridge,'turn_source','走法历史'),bridge.ours)))
@@ -246,7 +365,8 @@ class App:
                             if adopted is not engine:
                                 engine=adopted;bridge.engine=engine;bridge.tracker.engine=engine
                                 event('background_engine_adopted',process_id=engine.process.pid)
-                        else:ponder.clear()
+                        elif state=='complete':ponder.clear()
+                        else:ponder.pause()
                     if bridge.tracker.side==bridge.ours:
                         key=fen(bridge.tracker.board,bridge.tracker.side)
                         if key!=own_key:own_key=key;own_seen=trace.start;turn_compute=0
@@ -260,9 +380,14 @@ class App:
                                 if not probe_used:
                                     _,destination=move_pixels(bridge.pending,bridge.box,bridge.flipped)
                                     if self.stop.is_set():break
-                                    window.click(destination,rect);window.park(rect);probe_used=True;pending_since=time.time()
+                                    with self.action_lock:
+                                        if self.editor_pause.is_set():continue
+                                        window.click(destination,rect);window.park(rect);probe_used=True;pending_since=time.time()
                                     event('recover_destination',move=bridge.pending)
                                 else:
+                                    if connection['mode']=='grid':
+                                        bridge.await_initial_change=True;bridge.pending=None;pending_since=None;probe_used=False
+                                        self.events.put(('status','尚未确认本方落子，保留已算结果，等待对方或棋盘实际变化。'));continue
                                     if bootstrap:raise CalibrationRequired('落子未生效，棋盘已保留；请改选“我方先手/对方先手”后重新开始连接')
                                     event('retry_unaccepted_move',move=bridge.pending);bridge.pending=None;pending_since=None;probe_used=False
                     elif state=='turn_unconfirmed':
@@ -280,6 +405,7 @@ class App:
                         budget.record(bridge.tracker,bridge.tracker.last_evaluation)
                         decision_ms=round(decision_seconds*1000)
                         if self.stop.is_set():break
+                        if self.editor_pause.is_set():continue
                         if not commands.empty():continue
                         trace.stage('move_recheck')
                         # Recheck the board and geometry immediately before selecting a piece.
@@ -287,11 +413,13 @@ class App:
                         if board!=bridge.tracker.board or flipped!=bridge.flipped or box!=bridge.box or rect3!=rect:raise ValueError('计算期间棋盘或窗口变化，重新识别')
                         if not bridge.may_move(None):raise ValueError('行棋历史尚未确认本方走棋')
                         origin,destination=move_pixels(move,box,flipped)
-                        bridge.submitted(move);pending_since=time.time();probe_used=False
-                        trace.stage('click')
-                        window.click(origin,rect);time.sleep(.18)
-                        if self.stop.is_set():break
-                        window.click(destination,rect);window.park(rect)
+                        with self.action_lock:
+                            if self.editor_pause.is_set():continue
+                            bridge.submitted(move);pending_since=time.time();probe_used=False
+                            trace.stage('click')
+                            window.click(origin,rect);time.sleep(.18)
+                            if self.stop.is_set():break
+                            window.click(destination,rect);window.park(rect)
                         submitted+=1
                         total=time.monotonic()-(own_seen if own_seen is not None else trace.start)
                         self.events.put(('latency',(total,turn_compute)))
@@ -316,7 +444,7 @@ class App:
                     if auto_reconnect and any(t in msg for t in ('前台','窗口已关闭','只打开一个')) and recovery.attempt(time.time()):
                         if window.reconnect():event('focus_recovered')
                     if msg!=last_error:event('waiting',reason=msg);last_error=msg
-                    self.events.put(('status',friendly(msg)));self.stop.wait(.10)
+                    self.events.put(('status',friendly(msg)+' '+msg+'；可手动校正并续接。'));self.stop.wait(.10)
                 finally:
                     event('pipeline_timing',**trace.finish())
             event('stopped',count=submitted)
@@ -345,6 +473,8 @@ class App:
                     total,compute=value
                     self.latency_text.set(f'本步总用时：{total:.3f} 秒｜选招 {compute:.3f} 秒｜其他等待 {max(0,total-compute):.3f} 秒')
                 elif kind=='board_info':
+                    if value[2] is None and self.has_confirmed_board:continue
+                    if value[2] is not None:self.has_confirmed_board=True
                     board,self.last_move,side,self.view_flipped=value
                     self.connected_side=side
                     previous='尚未跟踪'
@@ -358,6 +488,11 @@ class App:
                     self.position_label.set(('红方走棋' if side=='w' else '黑方走棋' if side=='b' else '棋盘已识别，走棋方待校准')+'　上一步：'+previous)
                     self.draw(board)
                 elif kind=='status':self.status.set(value)
+                elif kind=='editor_ready':
+                    if self.editor_pause.is_set() and value==self.editor_generation:self.open_connection_editor()
+                elif kind=='recovery_applied':
+                    self.manual_calibration=value;self.manual_enabled.set(True);self.manual_text.set('两点定位：'+value['target']['title'])
+                    self.sandbox.end_recovery();self.status.set('手动校正已确认，已恢复连接；皮肤样本保存在本地。')
                 elif kind=='connection_info':
                     source,ours=value;self.connection_text.set(f'接入：{source}｜下方为本方（{"红" if ours=="w" else "黑"}）')
                 elif kind=='evaluation':self.show_evaluation(value)
@@ -371,7 +506,7 @@ class App:
                     elif state=='starting':self.ponder_text.set(f'后台预判：正在分析 {value["branches"]} 分支，使用 {value["threads"]} 线程')
                     elif state=='hit':self.ponder_text.set(f'后台预判：命中第 {value["rank"]} 分支｜深度 {value["depth"]}｜后台 {value["seconds"]:.1f} 秒')
                     elif state=='budget':self.ponder_text.set(f'后台预判：{"评分与主应手已稳定" if value["reason"]=="stable" else "已达预算"}，暂存结果｜{value["seconds"]:.1f} 秒')
-                    else:self.ponder_text.set({'idle':'后台预判：等待对方回合','paused':'后台预判：已暂停，等待棋盘稳定','disabled':'后台预判：已关闭','continue':'后台预判：接管已有缓存，继续计算实际局面','miss':'后台预判：对方偏离分支，正常计算','error':'后台预判：暂不可用，正常计算'}.get(state,'后台预判：等待对方回合'))
+                    else:self.ponder_text.set({'idle':'后台预判：等待对方回合','paused':'后台预判：已暂停，保留分支和搜索缓存','resumed':'后台预判：局面未变，沿用缓存继续分析','disabled':'后台预判：已关闭','continue':'后台预判：接管已有缓存，继续计算实际局面','miss':'后台预判：对方偏离分支，正常计算','error':'后台预判：暂不可用，正常计算'}.get(state,'后台预判：等待对方回合'))
                 elif kind=='done':
                     self.running=False;self.phase_started=None;self.phase_text.set('当前阶段：已停止');self.ponder_text.set('后台预判：已停止')
         except queue.Empty:pass

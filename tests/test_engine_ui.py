@@ -43,5 +43,23 @@ class EngineAndUiTests(unittest.TestCase):
         self.app.running=True;self.app.sandbox.analyze()
         self.assertFalse(self.app.sandbox.busy);self.assertIn('停止连接',self.app.sandbox.status.get())
         self.app.running=False
+    def test_manual_editor_pauses_and_queues_resume(self):
+        from tracker import replay_positions
+        _,board,_=replay_positions(START,[]);self.app.draw(board)
+        self.app.edit_connection();self.assertTrue(self.app.editor_pause.is_set())
+        self.assertEqual(self.app.sandbox.model.board,board)
+        with patch.object(self.app,'start') as start:
+            self.app.sandbox.confirm_recovery();start.assert_called_once()
+        command=self.app.recovery_commands.get_nowait()
+        self.assertEqual(command['board'],board);self.assertEqual(command['side'],'w')
+        self.app.sandbox.cancel_recovery();self.assertFalse(self.app.editor_pause.is_set())
+
+    def test_uncertain_frame_cannot_replace_confirmed_board(self):
+        from tracker import replay_positions
+        _,board,_=replay_positions(START,[])
+        self.app.events.put(('board_info',(board,'a3a4','b',False)));self.app.poll()
+        self.app.events.put(('board_info',([['_']*9 for _ in range(10)],None,None,True)));self.app.poll()
+        self.assertEqual(self.app.connected_board,board);self.assertEqual(self.app.connected_side,'b')
+        self.assertEqual(self.app.last_move,'a3a4');self.assertFalse(self.app.view_flipped)
 
 if __name__=='__main__':unittest.main()

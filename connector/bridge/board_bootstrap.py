@@ -58,6 +58,10 @@ def resolve(board,flipped,hint,history_path,mode,player,turn):
     relative=turn in ('ours','other')
     if turn=='ours':turn=ours
     elif turn=='other':turn='b' if ours=='w' else 'w'
+    if mode=='grid':
+        history=saved_turn(board,history_path)
+        if history in valid:return history,ours,False,'两点定位：已有走法历史'
+        return (turn if turn in valid else next(iter(valid))),ours,True,'两点定位：先手假设，等待实际变化验证'
     if mode!='auto':
         if turn not in valid:raise CalibrationRequired('棋盘已识别，所选走棋方与受将局面矛盾，请重新指定红/黑走棋')
         return turn,ours,False,'手动指定'

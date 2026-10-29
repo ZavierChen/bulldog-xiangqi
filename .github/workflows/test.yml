@@ -11,4 +11,5 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
       - run: python tools/install_engine.py
+      - run: python tools/install_ocr.py
       - run: python -m unittest discover -s tests -v

@@ -11,6 +11,7 @@ def main():
     if not python.exists():venv.EnvBuilder(with_pip=True).create(target)
     subprocess.run([str(python),'-m','pip','install','-r',str(ROOT/'requirements.txt')],check=True)
     subprocess.run([str(python),str(ROOT/'tools/install_engine.py')],check=True)
+    subprocess.run([str(python),str(ROOT/'tools/install_ocr.py')],check=True)
     if not args.cpu_only:
         subprocess.run([str(python),'-m','pip','install','--no-deps','--target',str(ROOT/'connector/gpu-runtime'),'onnxruntime-directml==1.24.4'],check=True)
     print('Setup complete. Open 启动斗牛犬.bat.')
