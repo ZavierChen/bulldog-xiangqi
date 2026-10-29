@@ -142,6 +142,24 @@ class App:
                     first,rect=window.capture();self.stop.wait(.12);second,rect2=window.capture()
                     if rect!=rect2:raise ValueError('窗口正在移动，重新定位')
                     if task:event('screen_flow_scan',stage=task,expected=flow.mode)
+                    if task:trace.stage('ad_scan')
+                    ad1=ads.button(first) if task else None
+                    ad2=ads.button(second) if task else None
+                    if ad1 and ad2 and max(abs(a-b) for a,b in zip(ad1,ad2))<3:
+                        recovery.lost(time.time())
+                        if time.monotonic()-last_ad>2:
+                            fresh,rect3=window.capture();point=ads.button(fresh)
+                            if rect3!=rect or not point or max(abs(a-b) for a,b in zip(point,ad2))>=3:raise ValueError('广告关闭按钮正在变化')
+                            if self.stop.is_set():break
+                            window.click(point,rect);window.park(rect);last_ad=time.monotonic();event('ad_closed',features=ads.last_features)
+                            flow.ad_closed()
+                            self.events.put(('status','已关闭广告，正在确认继续游戏入口…'));self.stop.wait(.3)
+                        else:flow.ad_wait();self.stop.wait(.1)
+                        continue
+                    if task and (ads.present(first) or ads.present(second)):
+                        self.events.put(('status','广告仍在遮挡，等待关闭入口；暂不点击后方按钮。'))
+                        flow.ad_wait()
+                        self.stop.wait(.2);continue
                     # This offer can appear before/after an ad or upgrade. Check
                     # its title + own red X before the generic ad-card heuristic.
                     if task:trace.stage('points_popup_scan')
@@ -160,24 +178,6 @@ class App:
                             self.events.put(('status','已关闭积分加速提示，正在恢复继续对局…'));self.stop.wait(.35)
                         else:self.stop.wait(.15)
                         continue
-                    if task in ('ad','fallback'):trace.stage('ad_scan')
-                    ad1=ads.button(first) if task in ('ad','fallback') else None
-                    ad2=ads.button(second) if task in ('ad','fallback') else None
-                    if ad1 and ad2 and max(abs(a-b) for a,b in zip(ad1,ad2))<3:
-                        recovery.lost(time.time())
-                        if time.monotonic()-last_ad>2:
-                            fresh,rect3=window.capture();point=ads.button(fresh)
-                            if rect3!=rect or not point or max(abs(a-b) for a,b in zip(point,ad2))>=3:raise ValueError('广告关闭按钮正在变化')
-                            if self.stop.is_set():break
-                            window.click(point,rect);window.park(rect);last_ad=time.monotonic();event('ad_closed')
-                            flow.ad_closed()
-                            self.events.put(('status','已关闭广告，正在确认继续游戏入口…'));self.stop.wait(.3)
-                        else:flow.ad_wait();self.stop.wait(.1)
-                        continue
-                    if task and (ads.present(first) or ads.present(second)):
-                        self.events.put(('status','广告仍在遮挡，等待关闭入口；暂不点击后方按钮。'))
-                        flow.ad_wait()
-                        self.stop.wait(.2);continue
                     if task in ('upgrade','fallback'):trace.stage('popup_scan')
                     popup1=popups.upgrade(first) if task in ('upgrade','fallback') else None
                     popup2=popups.upgrade(second) if task in ('upgrade','fallback') else None
